@@ -33,6 +33,84 @@ typedef struct {
     Row row_to_insert;  // only used by insert statement
 } Statement;
 
+/*
+Table structure that points to pages of rows and keeps track of how many rows there are.
+*/
+const uint32_t PAGE_SIZE = 4096;
+#define TABLE_MAX_PAGES 100   // arbitrary 
+
+
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
+const uint32_t ID_SIZE         =    size_of_attribute(Row, id);
+const uint32_t USERNAME_SIZE   =    size_of_attribute(Row, username);
+const uint32_t EMAIL_SIZE      =    size_of_attribute(Row, email);
+const uint32_t ID_OFFSET       =    0;
+const uint32_t USERNAME_OFFSET =    ID_OFFSET + ID_SIZE;
+const uint32_t EMAIL_OFFSET    =    USERNAME_OFFSET + USERNAME_SIZE;
+const uint32_t ROW_SIZE        =    ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
+
+struct Pager_t {
+    int file_descriptor;
+    uint32_t file_length;
+    void* pages[TABLE_MAX_PAGES];
+};
+typedef struct Pager_t Pager;
+
+
+struct Table_t {
+    uint32_t num_rows;
+    Pager* pager;
+};
+typedef struct Table_t Table;
+
+
+/**
+ * Create a cursor at the beginning of the table
+ * Create a cursor at the end of the table
+ * Access the row the cursor is pointing to
+ * Advance the cursor to the next row
+ * 
+ * Delete the row pointed to by a cursor
+ * Modify the row pointed to by a cursor
+ * Search a table for a given ID, and create a cursor pointing to the row with that ID
+ * */
+
+struct Cursor_t{
+    Table* table;
+    uint32_t row_num;
+    bool end_of_table;  // a position past the end of a table
+};
+typedef struct Cursor_t Cursor;
+
+
+Cursor* table_start(Table* table) {
+    Cursor* cursor = (Cursor* ) malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->row_num = 0;
+    cursor->end_of_table = (table->num_rows == 0);
+
+    return cursor;
+}
+
+Cursor* table_end(Table* table) {
+    Cursor* cursor = (Cursor* ) malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->row_num = table->num_rows;
+    cursor->end_of_table = true;
+
+    return cursor;
+}
+
+void cursor_advance(Cursor* cursor) {
+    cursor->row_num += 1;
+    if (cursor->row_num >= cursor->table->num_rows) {
+        cursor->end_of_table = true;
+    }
+}
+
+
 typedef enum { 
     EXECUTE_SUCCESS, 
     EXECUTE_TABLE_FULL 
@@ -53,16 +131,6 @@ typedef enum {
 
 
 
-/*Compact representation of a row*/
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
-const uint32_t ID_SIZE         =    size_of_attribute(Row, id);
-const uint32_t USERNAME_SIZE   =    size_of_attribute(Row, username);
-const uint32_t EMAIL_SIZE      =    size_of_attribute(Row, email);
-const uint32_t ID_OFFSET       =    0;
-const uint32_t USERNAME_OFFSET =    ID_OFFSET + ID_SIZE;
-const uint32_t EMAIL_OFFSET    =    USERNAME_OFFSET + USERNAME_SIZE;
-const uint32_t ROW_SIZE        =    ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-
 void serialize_row(Row* source, void* destination) {
     memcpy(destination + ID_OFFSET,       &(source->id),       ID_SIZE);
     memcpy(destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
@@ -79,28 +147,7 @@ void print_row(Row* row) {
     printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
-/*
-Table structure that points to pages of rows and keeps track of how many rows there are.
-*/
-const uint32_t PAGE_SIZE = 4096;
-#define TABLE_MAX_PAGES 100   // arbitrary 
 
-const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
-
-struct Pager_t {
-    int file_descriptor;
-    uint32_t file_length;
-    void* pages[TABLE_MAX_PAGES];
-};
-typedef struct Pager_t Pager;
-
-
-struct Table_t {
-    uint32_t num_rows;
-    Pager* pager;
-};
-typedef struct Table_t Table;
 
 void* get_page(Pager* pager, uint32_t page_num) {
     if (page_num > TABLE_MAX_PAGES) {
@@ -129,11 +176,12 @@ void* get_page(Pager* pager, uint32_t page_num) {
     return pager->pages[page_num];
 }
 
-void* row_slot(Table* table, uint32_t row_num) {
+void* cursor_value(Cursor* cursor) {
+    uint32_t row_num = cursor->row_num;
+
     uint32_t page_num = row_num / ROWS_PER_PAGE;
-
-    void* page = get_page(table->pager, page_num);
-
+    
+    void* page = get_page(cursor->table->pager, page_num);
     uint32_t row_offset    = row_num % ROWS_PER_PAGE;
     uint32_t byte_offset   = row_offset * ROW_SIZE;
     return page + byte_offset;
@@ -336,18 +384,27 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
     printf("row to insert\n");
 
     Row* row_to_insert = &(statement->row_to_insert);
+    Cursor* cursor = table_end(table);
 
-    serialize_row(row_to_insert, row_slot(table, table->num_rows));
+    serialize_row(row_to_insert, cursor_value(cursor));
     table->num_rows += 1;
+    
+    free(cursor);
+
     return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_select(Statement* statement, Table* table) {
+    Cursor* cursor = table_start(table);
+
     Row row;
-    for(uint32_t i = 0; i < table->num_rows; i++) {
-        deserialize_row(row_slot(table, i), &row);
+    while(!(cursor->end_of_table)) {
+        deserialize_row(cursor_value(cursor), &row);
         print_row(&row);
+        cursor_advance(cursor);
     }
+    free(cursor);
+
     return EXECUTE_SUCCESS;
 }
 
