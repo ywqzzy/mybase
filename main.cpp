@@ -10,6 +10,19 @@
 #define COLUMN_USERNAME_SIZE    32
 #define COLUMN_EMAIL_SIZE       255
 
+#define TABLE_MAX_PAGES 100   // arbitrary 
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
+const uint32_t PAGE_SIZE = 4096;
+const uint32_t ID_SIZE         =    size_of_attribute(Row, id);
+const uint32_t USERNAME_SIZE   =    size_of_attribute(Row, username);
+const uint32_t EMAIL_SIZE      =    size_of_attribute(Row, email);
+const uint32_t ID_OFFSET       =    0;
+const uint32_t USERNAME_OFFSET =    ID_OFFSET + ID_SIZE;
+const uint32_t EMAIL_OFFSET    =    USERNAME_OFFSET + USERNAME_SIZE;
+const uint32_t ROW_SIZE        =    ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
+
 typedef enum {
     STATEMENT_INSERT,
     STATEMENT_SELECT
@@ -34,23 +47,12 @@ typedef struct {
 } Statement;
 
 /*
-Table structure that points to pages of rows and keeps track of how many rows there are.
+Store rows in blocks of memory called pages
+Each page stores as many rows as it can fit
+Rows are serialized into a compact representation with each page
+Pages are only allocated as needed
+Keep a fixed-size array of pointers to pages
 */
-const uint32_t PAGE_SIZE = 4096;
-#define TABLE_MAX_PAGES 100   // arbitrary 
-
-
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
-const uint32_t ID_SIZE         =    size_of_attribute(Row, id);
-const uint32_t USERNAME_SIZE   =    size_of_attribute(Row, username);
-const uint32_t EMAIL_SIZE      =    size_of_attribute(Row, email);
-const uint32_t ID_OFFSET       =    0;
-const uint32_t USERNAME_OFFSET =    ID_OFFSET + ID_SIZE;
-const uint32_t EMAIL_OFFSET    =    USERNAME_OFFSET + USERNAME_SIZE;
-const uint32_t ROW_SIZE        =    ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
-
 struct Pager_t {
     int file_descriptor;
     uint32_t file_length;
@@ -58,7 +60,9 @@ struct Pager_t {
 };
 typedef struct Pager_t Pager;
 
-
+/*
+Table structure that points to pages of rows and keeps track of how many rows there are.
+*/
 struct Table_t {
     uint32_t num_rows;
     Pager* pager;
@@ -130,7 +134,7 @@ typedef enum {
 }PrepareResult;
 
 
-
+// Row methods
 void serialize_row(Row* source, void* destination) {
     memcpy(destination + ID_OFFSET,       &(source->id),       ID_SIZE);
     memcpy(destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
@@ -148,7 +152,7 @@ void print_row(Row* row) {
 }
 
 
-
+// page methods
 void* get_page(Pager* pager, uint32_t page_num) {
     if (page_num > TABLE_MAX_PAGES) {
         printf("Tried to fetch page number out of bound.  %d > %d\n", page_num, TABLE_MAX_PAGES);
@@ -176,17 +180,6 @@ void* get_page(Pager* pager, uint32_t page_num) {
     return pager->pages[page_num];
 }
 
-void* cursor_value(Cursor* cursor) {
-    uint32_t row_num = cursor->row_num;
-
-    uint32_t page_num = row_num / ROWS_PER_PAGE;
-    
-    void* page = get_page(cursor->table->pager, page_num);
-    uint32_t row_offset    = row_num % ROWS_PER_PAGE;
-    uint32_t byte_offset   = row_offset * ROW_SIZE;
-    return page + byte_offset;
-}
-
 Pager* pager_open(const char* filename) {
     int fd = open(filename, 
                   O_RDWR | // Read and Write mode
@@ -211,17 +204,6 @@ Pager* pager_open(const char* filename) {
     return pager;
 }
 
-Table* db_open(const char* filename) {
-    Pager* pager = pager_open(filename);
-    uint32_t num_rows = pager->file_length / ROW_SIZE;
-    Table* table = (Table*)malloc(sizeof(Table));
-    table->pager = pager;
-    table->num_rows = num_rows;
-    return table;
-}
-
-
-
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
     if (pager->pages[page_num] == NULL) {
         printf("Tried to flush null page\n");
@@ -239,6 +221,32 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
         printf("Error writing: %d\n", errno);
         exit(EXIT_FAILURE);
     }
+}
+
+/**
+ *  cursor methods
+ * */
+void* cursor_value(Cursor* cursor) {
+    uint32_t row_num = cursor->row_num;
+
+    uint32_t page_num = row_num / ROWS_PER_PAGE;
+    
+    void* page = get_page(cursor->table->pager, page_num);
+    uint32_t row_offset    = row_num % ROWS_PER_PAGE;
+    uint32_t byte_offset   = row_offset * ROW_SIZE;
+    return page + byte_offset;
+}
+
+/**
+ * db methods
+ * */
+Table* db_open(const char* filename) {
+    Pager* pager = pager_open(filename);
+    uint32_t num_rows = pager->file_length / ROW_SIZE;
+    Table* table = (Table*)malloc(sizeof(Table));
+    table->pager = pager;
+    table->num_rows = num_rows;
+    return table;
 }
 
 void db_close(Table* table) {
@@ -281,13 +289,6 @@ void db_close(Table* table) {
 }
 
 
-/*
-Store rows in blocks of memory called pages
-Each page stores as many rows as it can fit
-Rows are serialized into a compact representation with each page
-Pages are only allocated as needed
-Keep a fixed-size array of pointers to pages
-*/
 
 /*Input*/
 InputBuffer* new_input_buffer() {
@@ -375,7 +376,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
-/*Exuecute*/
+/*Exuecute statements*/
 ExecuteResult execute_insert(Statement* statement, Table* table) {
 
     if(table->num_rows >= TABLE_MAX_ROWS) {
@@ -416,6 +417,7 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
             return execute_select(statement, table);
     }
 }
+
 /*main*/
 int main(int argc, char* argv[]) {
     if (argc < 2) {
